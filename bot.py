@@ -1,113 +1,195 @@
 import logging
-import telebot
-from telebot import types
-import pandas as pd
-import torch
-from sentence_transformers import SentenceTransformer, util
-import chromadb
-from chromadb.config import Settings
 import os
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.enums import ParseMode
+from aiogram.filters import CommandStart, Command
+from aiogram.types import Message, KeyboardButton, ReplyKeyboardMarkup
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.client.default import DefaultBotProperties
+from dotenv import load_dotenv
+from chroma_utils import search_service
+import httpx
 
-# --- Настройки ---
-BOT_TOKEN = os.getenv("BOT_TOKEN", "your-telegram-bot-token")
-ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "@tgChannelForm")
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "deep-seek-tok")
-EMBEDDING_MODEL = "mxbai-embed-large"
 
-bot = telebot.TeleBot(BOT_TOKEN)
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+load_dotenv()
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TELEGRAM_CHANNEL_ID = os.getenv("ADMIN_CHAT_ID")
+DEEPSEEK_API_URL = os.getenv("DEEPSEEK_API_URL")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL")
 
-# --- Загрузка услуг ---
-df = pd.read_csv("rag_services.csv")
-services = df["Услуга"].tolist()
-prices = df["Стоимость (руб.)"].tolist()
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher(storage=MemoryStorage())
 
-# --- Подключение к ChromaDB с эмбеддингами ---
-client = chromadb.PersistentClient(path="chroma_db")
-collection = client.get_or_create_collection("auto_services")
+DEEPSEEK_SYSTEM_PROMPT = """
+Ты — эксперт автосервиса. Отвечай ясно и профессионально, с учётом задач клиентов по ремонту, диагностике и обслуживанию авто.
+"""
+OLLAMA_SYSTEM_PROMPT = """
+Ты — эксперт автосервиса. Отвечай ясно и профессионально, с учётом задач клиентов по ремонту, диагностике и обслуживанию авто.
+"""
 
-# --- Состояние пользователя ---
-user_state = {}
+# FSM
+class SignupForm(StatesGroup):
+    name = State()
+    phone = State()
+    car = State()
+    issue = State()
+    number = State()
+    time = State()
 
-# --- Главное меню ---
-def main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add(types.KeyboardButton("🚗 Запись на сервис"), types.KeyboardButton("🔧 Описать проблему"))
-    return markup
+# Главное меню
+main_menu = ReplyKeyboardMarkup(keyboard=[
+    [KeyboardButton(text="🔍 Поиск по услугам")],
+    [KeyboardButton(text="📝 Запись на сервис")],
+    [KeyboardButton(text="🤖 Agent")],
+    [KeyboardButton(text="🤖 llama Agent")],
+], resize_keyboard=True)
 
-# --- Start ---
-@bot.message_handler(commands=["start"])
-def handle_start(message):
-    bot.send_message(message.chat.id, "Привет! Я помогу вам записаться на автосервис или узнать стоимость услуги.", reply_markup=main_menu())
+# /start
+@dp.message(CommandStart())
+async def start(message: Message, state: FSMContext):
+    await state.update_data(mode="agent")
+    await message.answer("👋 Привет! Я автосервис-бот. Выберите действие:", reply_markup=main_menu)
 
-# --- Обработка кнопок ---
-@bot.message_handler(func=lambda m: m.text == "🚗 Запись на сервис")
-def handle_booking(message):
-    user_state[message.chat.id] = {"step": "name"}
-    bot.send_message(message.chat.id, "Как вас зовут?")
+# Режимы
+@dp.message(F.text == "🔍 Поиск по услугам")
+async def mode_chroma(message: Message, state: FSMContext):
+    await state.update_data(mode="chromadb")
+    await message.answer("✍️ Введите запрос для поиска по базе услуг:")
 
-@bot.message_handler(func=lambda m: m.text == "🔧 Описать проблему")
-def handle_problem_start(message):
-    bot.send_message(message.chat.id, "Опишите, пожалуйста, проблему с автомобилем.")
+@dp.message(F.text == "🤖 Agent")
+async def mode_deepseek(message: Message, state: FSMContext):
+    await state.update_data(mode="agent")
+    await message.answer("🤖 Режим DeepSeek активирован. Можешь задавать вопросы.")
 
-# --- Сбор информации ---
-@bot.message_handler(func=lambda message: user_state.get(message.chat.id, {}).get("step") is not None)
-def handle_data_collection(message):
-    user = user_state.setdefault(message.chat.id, {})
+@dp.message(F.text == "🤖 llama Agent")
+async def mode_ollama(message: Message, state: FSMContext):
+    await state.update_data(mode="localagent")
+    await message.answer("🤖 Режим локальной модели (Ollama) активирован. Задавай вопрос.")
 
-    if user["step"] == "name":
-        user["name"] = message.text
-        user["step"] = "phone"
-        bot.send_message(message.chat.id, "Введите ваш номер телефона:")
-    elif user["step"] == "phone":
-        user["phone"] = message.text
-        user["step"] = "car"
-        bot.send_message(message.chat.id, "Марка и модель автомобиля:")
-    elif user["step"] == "car":
-        user["car"] = message.text
-        user["step"] = "issue"
-        bot.send_message(message.chat.id, "Опишите проблему:")
-    elif user["step"] == "issue":
-        user["issue"] = message.text
-        user["step"] = "time"
-        bot.send_message(message.chat.id, "Укажите желаемое время записи:")
-    elif user["step"] == "time":
-        user["time"] = message.text
-        send_request_to_admin(message.chat.id)
-        del user_state[message.chat.id]
-        bot.send_message(message.chat.id, "Спасибо! Мы свяжемся с вами в ближайшее время.", reply_markup=main_menu())
+@dp.message(F.text == "📝 Запись на сервис")
+async def signup_start(message: Message, state: FSMContext):
+    await state.update_data(mode="signup")
+    await message.answer("📋 Введите ваше <b>имя</b> для записи:")
+    await state.set_state(SignupForm.name)
 
-# --- Отправка заявки администратору ---
-def send_request_to_admin(user_id):
-    user = user_state[user_id]
-    text = (
-        f"🆕 Заявка на сервис:\n"
-        f"👤 Имя: {user['name']}\n"
-        f"📱 Телефон: {user['phone']}\n"
-        f"🚘 Автомобиль: {user['car']}\n"
-        f"🔧 Проблема: {user['issue']}\n"
-        f"🕓 Время: {user['time']}"
+# FSM-поток (без изменений)
+@dp.message(SignupForm.name)
+async def get_name(message: Message, state: FSMContext):
+    await state.update_data(name=message.text)
+    await message.answer("📞 Телефон:")
+    await state.set_state(SignupForm.phone)
+
+@dp.message(SignupForm.phone)
+async def get_phone(message: Message, state: FSMContext):
+    await state.update_data(phone=message.text)
+    await message.answer("🚗 Марка машины:")
+    await state.set_state(SignupForm.car)
+
+@dp.message(SignupForm.car)
+async def get_car(message: Message, state: FSMContext):
+    await state.update_data(car=message.text)
+    await message.answer("⚠️ Опишите проблему:")
+    await state.set_state(SignupForm.issue)
+
+@dp.message(SignupForm.issue)
+async def get_issue(message: Message, state: FSMContext):
+    await state.update_data(issue=message.text)
+    await message.answer("📞🚗Введи номер машины")
+    await state.set_state(SignupForm.number)
+
+@dp.message(SignupForm.number)
+async def get_number(message: Message, state: FSMContext):
+    await state.update_data(number=message.text)
+    await message.answer("🕒 Желаемое время:")
+    await state.set_state(SignupForm.time)
+
+@dp.message(SignupForm.time)
+async def finish_signup(message: Message, state: FSMContext):
+    await state.update_data(time=message.text)
+    data = await state.get_data()
+    request_text = (
+        "📥 <b>Новая заявка:</b>\n\n"
+        f"👤 Имя: {data['name']}\n"
+        f"📞 Телефон: {data['phone']}\n"
+        f"🚗 Машина: {data['car']}\n"
+        f"⚠️ Проблема: {data['issue']}\n"
+        f"📞🚗 Номер машины: {data['number']}\n"
+        f"🕒 Время: {data['time']}"
     )
-    bot.send_message(ADMIN_CHAT_ID, text)
-    logging.info(f"Заявка отправлена: {text}")
+    await bot.send_message(chat_id=TELEGRAM_CHANNEL_ID, text=request_text)
+    await message.answer("✅ Заявка отправлена. Мы скоро свяжемся с вами!", reply_markup=main_menu)
+    await state.clear()
+    await state.update_data(mode="agent")
 
-# --- Поиск услуги по проблеме ---
-@bot.message_handler(func=lambda m: True)
-def handle_problem_search(message):
-    query = message.text
-    results = collection.query(query_texts=[query], n_results=1)
-    
-    if not results["documents"]:
-        bot.send_message(message.chat.id, "Услуга не найдена. Вот список доступных:", reply_markup=None)
-        service_list = "\n".join(f"{s} — {p} руб." for s, p in zip(services, prices))
-        bot.send_message(message.chat.id, service_list)
+# --- Запрос к DeepSeek
+async def ask_deepseek(user_input: str) -> str:
+    headers = {
+        "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+        "Content-Type": "application/json"
+    }
+
+    payload = {
+        "model": "deepseek-chat",
+        "messages": [
+            {"role": "system", "content": DEEPSEEK_SYSTEM_PROMPT},
+            {"role": "user", "content": user_input}
+        ],
+        "temperature": 0.7
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(DEEPSEEK_API_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        return response.json()["choices"][0]["message"]["content"]
+
+# --- Запрос к Ollama
+async def ask_ollama(user_input: str) -> str:
+    url = f"{OLLAMA_BASE_URL}/api/chat"
+    payload = {
+        "model": "deepseek-r1:latest",
+        "messages": [
+            {"role": "system", "content": OLLAMA_SYSTEM_PROMPT},
+            {"role": "user", "content": user_input}
+        ]
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(url, json=payload)
+        response.raise_for_status()
+        return response.json()["message"]["content"]
+
+# Универсальный обработчик
+@dp.message(F.text & ~F.text.startswith("/"))
+async def handle_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    mode = data.get("mode", "agent")
+
+    if mode == "chromadb":
+        await message.answer("🔎 Поиск по услугам...")
+        result = search_service(message.text)
+        await message.answer(result)
+    elif mode == "agent":
+        await message.answer("🤖 Думаю...")
+        try:
+            reply = await ask_deepseek(message.text)
+            await message.answer(reply)
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка DeepSeek: {e}")
+    elif mode == "localagent":
+        await message.answer("🤖 Думаю (локально)...")
+        try:
+            reply = await ask_ollama(message.text)
+            await message.answer(reply)
+        except Exception as e:
+            await message.answer(f"⚠️ Ошибка Ollama: {e}")
     else:
-        matched_service = results["documents"][0][0]
-        idx = services.index(matched_service)
-        response = f"✅ Предлагаем услугу: {matched_service}\n💰 Стоимость: {prices[idx]} руб."
-        bot.send_message(message.chat.id, response)
+        await message.answer("❗ Неизвестный режим. Используйте меню.", reply_markup=main_menu)
 
-# --- Запуск ---
+# Запуск
 if __name__ == "__main__":
-    logging.info("Бот запущен.")
-    bot.infinity_polling()
+    import asyncio
+    asyncio.run(dp.start_polling(bot))

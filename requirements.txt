@@ -1,7 +1,0 @@
-numpy<2.0.0
-python-telegram-bot==20.7
-sentence-transformers==2.6.1
-chromadb==0.4.24
-ollama==0.1.7
-python-dotenv==1.0.1
-pandas==2.2.2

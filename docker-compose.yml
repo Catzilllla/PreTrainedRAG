@@ -3,7 +3,7 @@ version: '3.9'
 services:
 
   bot:
-    build: .
+    build: ./bot
     container_name: auto_bot
     env_file:
       - .env
@@ -24,7 +24,7 @@ services:
     restart: unless-stopped
 
   chromadb:
-    image: chromadb/chroma:latest
+    build: ./db
     container_name: chromadb
     ports:
       - "8000:8000"
